@@ -11,6 +11,14 @@ st.caption("Paste a tweet or thread. Export Dot-ready artifacts.")
 with st.sidebar:
     st.header("Metadata")
     url = st.text_input("Tweet/Thread URL (optional)")
+    st.caption("Paste a tweet or thread. Export Dot-ready artifacts.")
+    
+    st.subheader("Source URL (optional)")
+    url_main = st.text_input(
+        "Paste the tweet or thread URL here",
+        placeholder="https://x.com/..."
+    )
+
     author = st.text_input("Author handle/name (optional)")
     published = st.text_input("Published date/time (optional)")
     ingested_at = datetime.date.today().isoformat()
@@ -63,7 +71,7 @@ Ingested_at: {ingested_at}
 
     prompt = f"""Dot: Librarian Ingest.
 
-Input: {url or '[paste source link]'}
+Input: {url_main or url or '[paste source link]'}
 State: {state}
 Intent shelf: {intent}
 Confidence: {confidence}
@@ -75,4 +83,7 @@ Captured text:
 
     st.download_button("Download source.md", source_md, file_name="source.md")
     st.download_button("Download dot_payload.json", json.dumps(payload,indent=2), file_name="dot_payload.json")
-    st.text_area("Ingestion Prompt (copy/paste)", prompt, height=200)
+    
+    st.subheader("Ingestion Prompt (tap to select & copy)")
+    st.code(prompt, language="text")
+
