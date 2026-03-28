@@ -1,7 +1,7 @@
 import re
 import json
 import datetime
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -9,8 +9,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Dot URL Ingestor", layout="wide")
 
-st.title("Dot URL Ingestor (v1 — URL-only)")
-st.caption("Paste a URL. The app fetches and extracts text, then exports Dot-ready artifacts.")
+st.title("Dot URL Ingestor (v2 — URL-only, Thread-capable)")
+st.caption("Paste a URL. If it's an X/Twitter link, the app will unroll the full thread via a thread-unroller endpoint.")
 
 # -----------------------------
 # Helpers
@@ -23,71 +23,68 @@ def normalize(t: str) -> str:
 def extract_visible_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove scripts/styles/nav/footer to reduce noise
+    # Remove noisy tags
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
         tag.decompose()
 
-    # Prefer <article> if it exists
-    article = soup.find("article")
-    container = article if article else soup.body if soup.body else soup
-
+    # Prefer article/main if present
+    container = soup.find("article") or soup.find("main") or soup.body or soup
     text = container.get_text(separator="\n")
+
+    # Cleanup
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # Optional: strip common link/media residue
+    text = re.sub(r"(?im)^\shttps?://t.co/\S+\s$", "", text)
+    text = re.sub(r"(?im)^\spic.twitter.com/\S+\s$", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
     return text
 
 def is_x_url(u: str) -> bool:
     host = (urlparse(u).netloc or "").lower()
     return host.endswith("x.com") or host.endswith("twitter.com")
 
-def fetch_x_oembed_text(u: str) -> str:
+def extract_tweet_id(u: str) -> str | None:
     """
-    Best-effort: Use official publish.twitter.com oEmbed endpoint to get the embedded HTML.
-    This often works for public tweets without login, but not guaranteed.
-    Returns extracted visible text.
+    Extract tweet_id from URLs like:
+    https://x.com/{user}/status/{id}
+    https://twitter.com/{user}/status/{id}
     """
-    endpoint = "https://publish.twitter.com/oembed"
-    r = requests.get(endpoint, params={"url": u, "omit_script": "true"}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    html = data.get("html", "")
-    if not html:
-        raise ValueError("oEmbed returned no HTML.")
-    return extract_visible_text_from_html(html)
+    path = urlparse(u).path
+    m = re.search(r"/status/(\d+)", path)
+    return m.group(1) if m else None
 
-def fetch_url_text(u: str) -> tuple[str, dict]:
+def build_unroll_url(tweet_id: str) -> str:
     """
-    Fetch URL and extract text. Returns (text, meta).
-    meta includes content-type and final_url.
+    Uses a deterministic unroll endpoint pattern:
+    https://twitter-thread.com/unroll/<tweet_id>
+    (This endpoint pattern is publicly visible on the site.)
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; DotURLIngestor/1.0)"
-    }
+    return f"https://twitter-thread.com/unroll/{tweet_id}"
+
+def fetch_html(u: str) -> tuple[str, dict]:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DotURLIngestor/2.0)"}
     r = requests.get(u, headers=headers, timeout=25, allow_redirects=True)
     r.raise_for_status()
+    return r.text, {"final_url": r.url, "content_type": r.headers.get("content-type", "")}
 
-    content_type = (r.headers.get("content-type") or "").lower()
-    final_url = r.url
-
-    if "application/pdf" in content_type:
-        raise ValueError("URL appears to be a PDF. Please download and upload the PDF for ingestion.")
-
-    if "text/html" not in content_type and "<html" not in r.text.lower():
-        raise ValueError(f"Unsupported content-type for auto extraction: {content_type}")
-
-    text = extract_visible_text_from_html(r.text)
-    return text, {"content_type": content_type, "final_url": final_url}
+def fetch_text_from_url(u: str) -> tuple[str, dict]:
+    html, meta = fetch_html(u)
+    text = extract_visible_text_from_html(html)
+    return text, meta
 
 def build_source_md(source_id, title, published, url, author, state, intent, confidence, ingested_at, body):
     return "\n".join([
-        f"# {source_id}: {title} (Web, Publish {published or 'unknown'})",
+        f"# {source_id}: {title} (Thread, Publish {published or 'unknown'})",
         "",
-        f"**URL:** {url or 'n/a'}",
-        f"**Author:** {author or 'unknown'}",
-        f"**State:** {state}",
-        f"**Intent:** {intent}",
-        f"**Confidence:** {confidence}",
-        f"**Ingested_at:** {ingested_at}",
+        f"URL: {url or 'n/a'}",
+        f"Author: {author or 'unknown'}",
+        f"State: {state}",
+        f"Intent: {intent}",
+        f"Confidence: {confidence}",
+        f"Ingested_at: {ingested_at}",
         "",
         "---",
         "",
@@ -98,7 +95,8 @@ def build_source_md(source_id, title, published, url, author, state, intent, con
         "---",
         "",
         "## Notes",
-        "- Auto-extracted from URL. Validate claims against source when needed."
+        "- Extracted via URL-only thread unroll pipeline (no X API token).",
+        "- Treat claims as Provisional unless validated."
     ])
 
 def build_prompt(url, state, intent, confidence, body):
@@ -122,7 +120,7 @@ def build_prompt(url, state, intent, confidence, body):
     ])
 
 # -----------------------------
-# Session state (persist outputs across downloads/reruns)
+# Session state
 # -----------------------------
 for key, default in {
     "generated": False,
@@ -130,7 +128,8 @@ for key, default in {
     "payload_str": "",
     "prompt": "",
     "extracted_text": "",
-    "last_error": ""
+    "last_error": "",
+    "effective_url": ""
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -139,9 +138,12 @@ for key, default in {
 # UI
 # -----------------------------
 st.subheader("1) Paste URL")
-url_main = st.text_input(
-    "URL",
-    placeholder="https://x.com/...  or  https://example.com/article"
+url_main = st.text_input("URL", placeholder="https://x.com/...")
+
+mode = st.radio(
+    "Mode",
+    ["Auto (tweet or thread)", "Force thread (use unroll endpoint)"],
+    index=0
 )
 
 with st.sidebar:
@@ -157,47 +159,67 @@ with st.sidebar:
     )
     state = st.selectbox("Source state", ["Unread", "In-Progress", "Ingested", "Archived"], index=0)
     confidence = st.selectbox("Confidence", ["Provisional", "Validated"], index=0)
-    title = st.text_input("Title", value="URL Capture")
+    title = st.text_input("Title", value="X Thread")
 
 st.subheader("2) Fetch + Extract")
-fetch_clicked = st.button("Fetch text from URL", type="primary")
+fetch_clicked = st.button("Fetch", type="primary")
 
 if fetch_clicked:
     st.session_state.last_error = ""
     st.session_state.extracted_text = ""
     st.session_state.generated = False
+    st.session_state.effective_url = ""
 
     if not url_main.strip():
         st.session_state.last_error = "Please paste a URL first."
     else:
         u = url_main.strip()
+
         try:
-            # Special handling for X URLs
+            effective = u
+
+            # If X URL, decide whether to unroll
             if is_x_url(u):
-                extracted = fetch_x_oembed_text(u)
-                st.session_state.extracted_text = normalize(extracted)
+                tweet_id = extract_tweet_id(u)
+                if not tweet_id:
+                    raise ValueError("Could not find tweet_id in the URL. Expected /status/<id>.")
+
+                if mode.startswith("Force thread"):
+                    effective = build_unroll_url(tweet_id)
+                else:
+                    # Auto mode: try thread-unroll first (best for your use case),
+                    # fall back to fetching the tweet page itself.
+                    try:
+                        effective = build_unroll_url(tweet_id)
+                        text, meta = fetch_text_from_url(effective)
+                        if len(text) < 200:
+                            raise ValueError("Unroll text too short; falling back to direct fetch.")
+                    except Exception:
+                        effective = u
+                        text, meta = fetch_text_from_url(effective)
+
             else:
-                extracted, meta = fetch_url_text(u)
-                st.session_state.extracted_text = normalize(extracted)
+                text, meta = fetch_text_from_url(effective)
+
+            st.session_state.effective_url = effective
+            st.session_state.extracted_text = normalize(text)
+
         except Exception as e:
             st.session_state.last_error = str(e)
 
 if st.session_state.last_error:
     st.error(st.session_state.last_error)
-    st.info(
-        "If this is an X (Twitter) link and extraction fails, X may be blocking access. "
-        "Tier 2 can add an X API token for reliable URL-only extraction."
-    )
+    st.info("This URL-only thread method depends on the availability of the unroll endpoint. If it fails, try again later or switch to direct fetch.")
 
 if st.session_state.extracted_text:
     st.subheader("3) Review extracted text (optional)")
-    st.text_area("Extracted text", st.session_state.extracted_text, height=220)
+    st.text_area("Extracted text", st.session_state.extracted_text, height=240)
 
     gen_clicked = st.button("Generate Dot outputs")
 
     if gen_clicked:
         body = st.session_state.extracted_text
-        source_id = "S_URL"
+        source_id = "S_THREAD"
 
         source_md = build_source_md(
             source_id=source_id,
@@ -226,10 +248,11 @@ if st.session_state.extracted_text:
                 "state": state,
                 "intent": intent,
                 "confidence": confidence,
-                "content": body
+                "content": body,
+                "extraction_url": st.session_state.effective_url
             },
             "nodes": [
-                {"id": source_id, "type": "S", "name": f"{title} (Web, Publish {published or 'unknown'})"}
+                {"id": source_id, "type": "S", "name": f"{title} (Thread, Publish {published or 'unknown'})"}
             ],
             "edges": [],
             "placeholders": {"concepts": [], "claims": [], "frameworks": [], "work_artifacts": []}
@@ -242,34 +265,19 @@ if st.session_state.extracted_text:
         st.session_state.prompt = prompt
         st.session_state.generated = True
 
-# -----------------------------
-# Outputs (persist after download)
-# -----------------------------
 if st.session_state.generated:
     st.markdown("---")
     st.subheader("Outputs")
 
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button(
-            "Download source.md",
-            data=st.session_state.source_md,
-            file_name="source.md",
-            mime="text/markdown",
-            key="dl_source"
-        )
+        st.download_button("Download source.md", st.session_state.source_md, file_name="source.md", mime="text/markdown")
     with c2:
-        st.download_button(
-            "Download dot_payload.json",
-            data=st.session_state.payload_str,
-            file_name="dot_payload.json",
-            mime="application/json",
-            key="dl_json"
-        )
+        st.download_button("Download dot_payload.json", st.session_state.payload_str, file_name="dot_payload.json", mime="application/json")
 
     st.subheader("Ingestion Prompt (tap to select & copy)")
     st.code(st.session_state.prompt, language="text")
-    st.info("On iPhone: long-press in the code block → Select All → Copy.")
+    st.caption(f"Fetched via: {st.session_state.effective_url}")
 
 st.markdown("---")
-st.caption("v1 URL-only. For X threads reliably, add Tier 2 (X API token in Streamlit secrets).")
+st.caption("Thread mode uses an unroll endpoint pattern like /unroll/<tweet_id>. Availability may vary over time.")  # see note below
