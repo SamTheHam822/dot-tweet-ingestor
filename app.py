@@ -14,8 +14,8 @@ import streamlit as st
 st.set_page_config(page_title="Dot URL Ingestor", layout="wide")
 st.title("Dot URL Ingestor (v3 — URL-only, Thread-capable, Multi-Unroll)")
 st.caption(
-    "Paste a URL. For X/Twitter links, Auto mode tries multiple unroll endpoints (thread-first) "
-    "and skips JS 'loading shell' pages, then falls back to direct fetch."
+    "Paste a URL. For X/Twitter links, Auto mode tries multiple unroll endpoints (thread-first), "
+    "skips JS loading-shell pages, then falls back to direct fetch."
 )
 
 
@@ -33,43 +33,45 @@ def is_x_url(u: str) -> bool:
     return host.endswith("x.com") or host.endswith("twitter.com")
 
 
-def extract_tweet_id(u: str) -> str | None:
+def extract_tweet_id(u: str):
+    """
+    Extract tweet_id from:
+    https://x.com/<user>/status/<id>
+    https://twitter.com/<user>/status/<id>
+    """
     m = re.search(r"/status/(\d+)", urlparse(u).path)
     return m.group(1) if m else None
 
 
-# ---- Provider 1b: multiple deterministic unroll endpoints
-# Provider A: twitter-thread.com/t/<tweet_id> (often contains actual thread content)
-# Provider B: twitter-thread.com/unroll/<tweet_id> (can return a JS "Gathering the Tweets..." shell)
-def build_unroll_candidates(tweet_id: str) -> listreturn [
-        {
-            "name": "twitter-thread.com (t)",
-            "url": f"https://twitter-thread.com/t/{tweet_id}",
-            "notes": "Try direct thread page first.",
-        },
-        {
-            "name": "twitter-thread.com (unroll)",
-            "url": f"https://twitter-thread.com/unroll/{tweet_id}",
-            "notes": "May return a JS loading shell; we detect and skip.",
-        },
+def build_unroll_candidates(tweet_id: str):
+    """
+    Provider-1b: multiple deterministic unroll endpoints.
+    We try /t/<id> first, then /unroll/<id>.
+    """
+    return [
+        {"name": "twitter-thread.com (t)", "url": f"https://twitter-thread.com/t/{tweet_id}"},
+        {"name": "twitter-thread.com (unroll)", "url": f"https://twitter-thread.com/unroll/{tweet_id}"},
     ]
 
 
 def extract_visible_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
 
+    # Remove noisy tags
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
         tag.decompose()
 
     container = soup.find("article") or soup.find("main") or soup.body or soup
     text = container.get_text(separator="\n")
 
+    # Cleanup whitespace
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
 
 def strip_link_media_residue(text: str) -> str:
+    # Remove t.co and pic.twitter.com lines that add noise
     text = re.sub(r"(?im)^\shttps?://t.co/\S+\s$", "", text)
     text = re.sub(r"(?im)^\spic.twitter.com/\S+\s$", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -78,21 +80,22 @@ def strip_link_media_residue(text: str) -> str:
 
 def looks_like_js_loading_shell(text: str) -> bool:
     """
-    Detect common 'loading' shell pages (no thread content) like:
+    Detect pages that are basically a JS-driven loading shell, e.g.:
     'Unrolling your thread... Gathering the Tweets...'
     """
     t = (text or "").lower()
     signals = [
         "unrolling your thread",
         "gathering the tweets",
+        "unrolling thread",
+        "gathering tweets",
         "unrolling your thread...",
         "gathering the tweets...",
-        "read twitter/x threads in a clean format",  # generic landing blurbs
     ]
     return any(s in t for s in signals)
 
 
-def fetch_html(u: str) -> tuple[str, dict]:
+def fetch_html(u: str):
     headers = {"User-Agent": "Mozilla/5.0 (compatible; DotURLIngestor/3.0)"}
     r = requests.get(u, headers=headers, timeout=25, allow_redirects=True)
     r.raise_for_status()
@@ -104,41 +107,38 @@ def fetch_html(u: str) -> tuple[str, dict]:
     return r.text, meta
 
 
-def fetch_text_from_url(u: str) -> tuple[str, dict]:
+def fetch_text_from_url(u: str):
     html, meta = fetch_html(u)
     ct = (meta.get("content_type") or "").lower()
     if "application/pdf" in ct:
-        raise ValueError("URL appears to be a PDF. Download and upload the PDF instead.")
+        raise ValueError("URL looks like a PDF. Download and upload the PDF instead.")
     text = extract_visible_text_from_html(html)
     text = strip_link_media_residue(text)
     return text, meta
 
 
-def try_unroll_providers(tweet_id: str, min_chars: int = 400) -> tuple[str, str, list[str]]:
+def try_unroll_providers(tweet_id: str, min_chars: int = 400):
     """
     Try multiple unroll endpoints and return:
     (best_text, used_url, debug_log)
     """
     debug = []
-    for candidate in build_unroll_candidates(tweet_id):
-        name = candidate["name"]
-        url = candidate["url"]
+    for cand in build_unroll_candidates(tweet_id):
+        name = cand["name"]
+        url = cand["url"]
         try:
             text, meta = fetch_text_from_url(url)
             debug.append(f"✅ {name}: fetched {len(text)} chars from {url}")
 
-            # Skip JS shells
             if looks_like_js_loading_shell(text):
                 debug.append(f"⚠️ {name}: detected JS loading shell; skipping")
                 continue
 
-            # Require a minimum size to be confident it's a real thread page
             if len(text.strip()) < min_chars:
                 debug.append(f"⚠️ {name}: too short (<{min_chars}); skipping")
                 continue
 
             return text, url, debug
-
         except Exception as e:
             debug.append(f"❌ {name}: error: {str(e)}")
 
@@ -257,34 +257,27 @@ if fetch_clicked:
         effective = u
 
         try:
-            # X URL logic
             if is_x_url(u):
                 tweet_id = extract_tweet_id(u)
                 if not tweet_id:
                     raise ValueError("Could not find tweet_id in the URL. Expected /status/<id>.")
 
                 if mode.startswith("Force direct"):
-                    # Direct only
                     effective = u
                     text, meta = fetch_text_from_url(effective)
                     if len(text.strip()) < 200:
                         raise ValueError("Direct fetch returned too little text (likely blocked).")
 
                 else:
-                    # Thread path: try multiple unroll providers first
                     text, used_unroll_url, debug = try_unroll_providers(tweet_id)
                     st.session_state.debug_log.extend(debug)
 
                     if mode.startswith("Force thread"):
                         if not text:
-                            raise ValueError(
-                                "Thread extraction failed across all unroll providers "
-                                "(they may be blocked/rate-limited or JS-only)."
-                            )
+                            raise ValueError("Thread extraction failed across all unroll providers.")
                         effective = used_unroll_url
 
                     else:
-                        # Auto mode: if unroll fails, fall back to direct fetch
                         if text:
                             effective = used_unroll_url
                         else:
@@ -293,11 +286,8 @@ if fetch_clicked:
                             text, meta = fetch_text_from_url(effective)
 
                             if looks_like_js_loading_shell(text) or len(text.strip()) < 200:
-                                raise ValueError(
-                                    "Could not extract thread text (unroll failed and direct fetch is blocked/empty)."
-                                )
+                                raise ValueError("Could not extract thread text (unroll failed and direct fetch is blocked/empty).")
 
-            # Non-X URL logic
             else:
                 text, meta = fetch_text_from_url(effective)
                 if len(text.strip()) < 200:
@@ -411,5 +401,5 @@ if st.session_state.generated:
 st.markdown("---")
 st.caption(
     "Auto mode tries thread unroll endpoints first and skips JS 'loading shell' pages "
-    "(e.g., 'Unrolling your thread... Gathering the Tweets...') before falling back. "
+    "before falling back to direct fetch."
 )
