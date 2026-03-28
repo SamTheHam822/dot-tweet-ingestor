@@ -138,10 +138,15 @@ def fetch_text_from_url(u: str):
     ct = (meta.get("content_type") or "").lower()
     if "application/pdf" in ct:
         raise ValueError("URL looks like a PDF. Download and upload the PDF instead.")
-    text = extract_visible_text_from_html(html)
-    text = strip_link_media_residue(text)
-    return text, meta
+    
+    # Special-case Thread Reader App pages
+    if is_threadreader_url(u):
+        text = extract_threadreader_text(html)
+    else:
+        text = extract_visible_text_from_html(html)
+        text = strip_link_media_residue(text)
 
+    return text, meta
 
 def try_unroll_stack(x_url: str, min_chars: int = 400):
     """
@@ -219,6 +224,64 @@ def build_prompt(url, state, intent, confidence, body):
         "---",
         body
     ])
+
+def is_threadreader_url(u: str) -> bool:
+    return (urlparse(u).netloc or "").lower().endswith("threadreaderapp.com")
+
+def extract_threadreader_text(html: str) -> str:
+    """
+    Thread Reader App pages include lots of UI chrome (Share/Email/How-to/Donate).
+    We try to isolate the main thread content, then fall back safely.
+    Thread Reader App is explicitly built to display threads with extra UI. 
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # remove noisy tags
+    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
+        tag.decompose()
+
+    # Heuristic: ThreadReader pages usually have the thread content in the main/article area.
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+
+    text = main.get_text(separator="\n")
+
+    # Remove common UI blocks by phrase anchors (robust against HTML changes)
+    kill_phrases = [
+        "Share this page!",
+        "Enter URL or ID to Unroll",
+        "How to get URL link on X",
+        "Missing some Tweet in this thread?",
+        "force a refresh",
+        "This Thread may be Removed Anytime!",
+        "Save it as PDF for later use!",
+        "Try unrolling a thread yourself!",
+        "Did Thread Reader help you today?",
+        "Support us!",
+        "Become a Premium Member",
+        "Donate via Paypal",
+        "Or Donate anonymously using crypto!",
+        "Follow @ThreadReaderApp",
+        "@threadreaderapp unroll",
+        "Email the whole thread",
+    ]
+
+    lines = [ln.strip() for ln in text.splitlines()]
+    cleaned = []
+    for ln in lines:
+        if not ln:
+            continue
+        # skip UI noise lines
+        if any(p.lower() in ln.lower() for p in kill_phrases):
+            continue
+        # skip repetitive UI words
+        if ln.lower() in {"post", "share", "email", "practice here", "read on x", "scrolly"}:
+            continue
+        cleaned.append(ln)
+
+    # Collapse into readable blocks
+    out = "\n".join(cleaned)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
 
 
 # =========================
