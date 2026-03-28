@@ -230,55 +230,106 @@ def is_threadreader_url(u: str) -> bool:
 
 def extract_threadreader_text(html: str) -> str:
     """
-    Thread Reader App pages include lots of UI chrome (Share/Email/How-to/Donate).
-    We try to isolate the main thread content, then fall back safely.
-    Thread Reader App is explicitly built to display threads with extra UI. 
+    Extract only the actual thread text from a Thread Reader App page by slicing
+    between clear start/end anchors, then apply light cleanup.
+
+    Thread Reader App pages include extensive UI (share/unroll/help/subscribe/donate). 
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # remove noisy tags
+    # Remove noisy tags
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
         tag.decompose()
 
-    # Heuristic: ThreadReader pages usually have the thread content in the main/article area.
     main = soup.find("main") or soup.find("article") or soup.body or soup
+    raw = main.get_text(separator="\n")
 
-    text = main.get_text(separator="\n")
+    # Normalize whitespace early
+    raw = re.sub(r"[ \t]+\n", "\n", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
 
-    # Remove common UI blocks by phrase anchors (robust against HTML changes)
-    kill_phrases = [
-        "Share this page!",
-        "Enter URL or ID to Unroll",
-        "How to get URL link on X",
-        "Missing some Tweet in this thread?",
-        "force a refresh",
-        "This Thread may be Removed Anytime!",
-        "Save it as PDF for later use!",
-        "Try unrolling a thread yourself!",
-        "Did Thread Reader help you today?",
-        "Support us!",
+    # Split into lines for slicing
+    lines = [ln.strip() for ln in raw.splitlines()]
+    lines = [ln for ln in lines if ln]  # drop blanks
+
+    # -------------------------
+    # Anchor-based slicing
+    # -------------------------
+    # END markers (footer/promotions start)
+    end_markers = [
+        "Keep Current with",
+        "Stay in touch and get notified",
+        "This Thread may be Removed Anytime",
+        "Try unrolling a thread yourself",
+        "Did Thread Reader help you today",
         "Become a Premium Member",
         "Donate via Paypal",
-        "Or Donate anonymously using crypto!",
-        "Follow @ThreadReaderApp",
-        "@threadreaderapp unroll",
+        "Or Donate anonymously using crypto",
         "Email the whole thread",
     ]
 
-    lines = [ln.strip() for ln in text.splitlines()]
+    # START markers:
+    # Prefer the actual thread opening line if present.
+    # If not, fall back to the first substantive paragraph after the header block.
+    start_idx = None
+    for i, ln in enumerate(lines):
+        if ln.startswith("My dear front-end developers"):
+            start_idx = i
+            break
+
+    # Fallback start: after the "tweets / read" header area (e.g., "11 tweets", "5 min read")
+    if start_idx is None:
+        for i, ln in enumerate(lines):
+            if re.search(r"\b\d+\s+tweets\b", ln):
+                # start a few lines after the header
+                start_idx = min(i + 1, len(lines) - 1)
+                break
+
+    if start_idx is None:
+        start_idx = 0  # last resort
+
+    end_idx = None
+    for i in range(start_idx, len(lines)):
+        ln = lines[i]
+        if any(ln.startswith(m) for m in end_markers):
+            end_idx = i
+            break
+
+    if end_idx is None:
+        end_idx = len(lines)
+
+    core = lines[start_idx:end_idx]
+
+    # -------------------------
+    # Line-level cleanup
+    # -------------------------
+    # Remove stray UI glyph lines like '×' and common instruction fragments
+    kill_exact = {"×", "Post", "Share", "Email", "Send Email!", "Follow Us!", "copy"}
+    kill_contains = [
+        "How to get URL link on X",
+        "Copy Link to Tweet",
+        "Paste it above and click",
+        "More info at",
+        "Twitter Help",
+        "@threadreaderapp unroll",
+        "Enter URL or ID to Unroll",
+        "Read on X",
+        "Scrolly",
+    ]
+
     cleaned = []
-    for ln in lines:
-        if not ln:
+    for ln in core:
+        if ln in kill_exact:
             continue
-        # skip UI noise lines
-        if any(p.lower() in ln.lower() for p in kill_phrases):
+        if any(s.lower() in ln.lower() for s in kill_contains):
             continue
-        # skip repetitive UI words
-        if ln.lower() in {"post", "share", "email", "practice here", "read on x", "scrolly"}:
+        # Strip obvious crypto address lines (defensive)
+        if re.match(r"^0x[a-fA-F0-9]{40}$", ln):  # Ethereum-like
+            continue
+        if re.match(r"^[13]{25,34}$", ln):  # Bitcoin-like
             continue
         cleaned.append(ln)
 
-    # Collapse into readable blocks
     out = "\n".join(cleaned)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
