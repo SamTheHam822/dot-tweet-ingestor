@@ -12,9 +12,10 @@ import streamlit as st
 # App Config
 # =========================
 st.set_page_config(page_title="Dot URL Ingestor", layout="wide")
-st.title("Dot URL Ingestor (v2 — URL-only, Thread-capable)")
+st.title("Dot URL Ingestor (v3 — URL-only, Thread-capable, Multi-Unroll)")
 st.caption(
-    "Paste a URL. If it's an X/Twitter link, the app tries to fetch the full thread via an unroll endpoint first, then falls back."
+    "Paste a URL. For X/Twitter links, Auto mode tries multiple unroll endpoints (thread-first) "
+    "and skips JS 'loading shell' pages, then falls back to direct fetch."
 )
 
 
@@ -33,57 +34,66 @@ def is_x_url(u: str) -> bool:
 
 
 def extract_tweet_id(u: str) -> str | None:
-    """
-    Extract tweet_id from URLs like:
-    https://x.com/{user}/status/{id}
-    https://twitter.com/{user}/status/{id}
-    """
-    path = urlparse(u).path
-    m = re.search(r"/status/(\d+)", path)
+    m = re.search(r"/status/(\d+)", urlparse(u).path)
     return m.group(1) if m else None
 
 
-def build_unroll_url(tweet_id: str) -> str:
-    """
-    Provider 1: deterministic unroll endpoint pattern.
-    Example: https://twitter-thread.com/unroll/<tweet_id> 
-    """
-    return f"https://twitter-thread.com/unroll/{tweet_id}"
+# ---- Provider 1b: multiple deterministic unroll endpoints
+# Provider A: twitter-thread.com/t/<tweet_id> (often contains actual thread content)
+# Provider B: twitter-thread.com/unroll/<tweet_id> (can return a JS "Gathering the Tweets..." shell)
+def build_unroll_candidates(tweet_id: str) -> listreturn [
+        {
+            "name": "twitter-thread.com (t)",
+            "url": f"https://twitter-thread.com/t/{tweet_id}",
+            "notes": "Try direct thread page first.",
+        },
+        {
+            "name": "twitter-thread.com (unroll)",
+            "url": f"https://twitter-thread.com/unroll/{tweet_id}",
+            "notes": "May return a JS loading shell; we detect and skip.",
+        },
+    ]
 
 
 def extract_visible_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove common noise
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
         tag.decompose()
 
-    # Prefer <article> or <main> if present
     container = soup.find("article") or soup.find("main") or soup.body or soup
     text = container.get_text(separator="\n")
 
-    # Cleanup whitespace
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-
     return text
 
 
 def strip_link_media_residue(text: str) -> str:
-    """
-    Remove common shortlink/media lines that add noise for concept extraction.
-    """
-    # Remove t.co lines
     text = re.sub(r"(?im)^\shttps?://t.co/\S+\s$", "", text)
-    # Remove pic.twitter.com lines
     text = re.sub(r"(?im)^\spic.twitter.com/\S+\s$", "", text)
-    # Collapse blanks again
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
 
+def looks_like_js_loading_shell(text: str) -> bool:
+    """
+    Detect common 'loading' shell pages (no thread content) like:
+    'Unrolling your thread... Gathering the Tweets...'
+    """
+    t = (text or "").lower()
+    signals = [
+        "unrolling your thread",
+        "gathering the tweets",
+        "unrolling your thread...",
+        "gathering the tweets...",
+        "read twitter/x threads in a clean format",  # generic landing blurbs
+    ]
+    return any(s in t for s in signals)
+
+
 def fetch_html(u: str) -> tuple[str, dict]:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; DotURLIngestor/2.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DotURLIngestor/3.0)"}
     r = requests.get(u, headers=headers, timeout=25, allow_redirects=True)
     r.raise_for_status()
     meta = {
@@ -96,15 +106,43 @@ def fetch_html(u: str) -> tuple[str, dict]:
 
 def fetch_text_from_url(u: str) -> tuple[str, dict]:
     html, meta = fetch_html(u)
-
-    # Basic content-type guard (many sites omit text/html correctly; keep soft)
     ct = (meta.get("content_type") or "").lower()
     if "application/pdf" in ct:
-        raise ValueError("URL appears to be a PDF. Please download and upload the PDF instead of URL ingestion.")
-
+        raise ValueError("URL appears to be a PDF. Download and upload the PDF instead.")
     text = extract_visible_text_from_html(html)
     text = strip_link_media_residue(text)
     return text, meta
+
+
+def try_unroll_providers(tweet_id: str, min_chars: int = 400) -> tuple[str, str, list[str]]:
+    """
+    Try multiple unroll endpoints and return:
+    (best_text, used_url, debug_log)
+    """
+    debug = []
+    for candidate in build_unroll_candidates(tweet_id):
+        name = candidate["name"]
+        url = candidate["url"]
+        try:
+            text, meta = fetch_text_from_url(url)
+            debug.append(f"✅ {name}: fetched {len(text)} chars from {url}")
+
+            # Skip JS shells
+            if looks_like_js_loading_shell(text):
+                debug.append(f"⚠️ {name}: detected JS loading shell; skipping")
+                continue
+
+            # Require a minimum size to be confident it's a real thread page
+            if len(text.strip()) < min_chars:
+                debug.append(f"⚠️ {name}: too short (<{min_chars}); skipping")
+                continue
+
+            return text, url, debug
+
+        except Exception as e:
+            debug.append(f"❌ {name}: error: {str(e)}")
+
+    return "", "", debug
 
 
 def build_source_md(source_id, title, published, url, author, state, intent, confidence, ingested_at, body, extraction_url):
@@ -128,8 +166,8 @@ def build_source_md(source_id, title, published, url, author, state, intent, con
         "---",
         "",
         "## Notes",
-        "- URL-only thread ingestion pipeline (no X API token).",
-        "- Treat claims as Provisional unless validated against the source."
+        "- URL-only thread ingestion using multi-unroll providers.",
+        "- Treat claims as Provisional unless validated against the source.",
     ])
 
 
@@ -155,7 +193,7 @@ def build_prompt(url, state, intent, confidence, body):
 
 
 # =========================
-# Session state (persist outputs across reruns/downloads)
+# Session state
 # =========================
 defaults = {
     "generated": False,
@@ -165,6 +203,7 @@ defaults = {
     "extracted_text": "",
     "last_error": "",
     "effective_url": "",
+    "debug_log": [],
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -175,13 +214,12 @@ for k, v in defaults.items():
 # UI
 # =========================
 st.subheader("1) Paste URL")
-url_main = st.text_input("URL", placeholder="https://x.com/... or https://example.com/article")
+url_main = st.text_input("URL", placeholder="https://x.com/...")
 
 mode = st.radio(
     "Mode",
     ["Auto (unroll-first → fallback)", "Force thread (unroll only)", "Force direct (no unroll)"],
-    index=0,
-    horizontal=False
+    index=0
 )
 
 with st.sidebar:
@@ -197,8 +235,9 @@ with st.sidebar:
     )
     state = st.selectbox("Source state", ["Unread", "In-Progress", "Ingested", "Archived"], index=0)
     confidence = st.selectbox("Confidence", ["Provisional", "Validated"], index=0)
-
     title = st.text_input("Title", value="X Thread")
+
+    show_debug = st.checkbox("Show debug log", value=True)
 
 
 st.subheader("2) Fetch + Extract")
@@ -209,6 +248,7 @@ if fetch_clicked:
     st.session_state.extracted_text = ""
     st.session_state.generated = False
     st.session_state.effective_url = ""
+    st.session_state.debug_log = []
 
     if not url_main.strip():
         st.session_state.last_error = "Please paste a URL first."
@@ -223,35 +263,45 @@ if fetch_clicked:
                 if not tweet_id:
                     raise ValueError("Could not find tweet_id in the URL. Expected /status/<id>.")
 
-                unroll_url = build_unroll_url(tweet_id)
-
-                if mode.startswith("Force thread"):
-                    # Unroll only
-                    effective = unroll_url
-                    text, meta = fetch_text_from_url(effective)
-
-                    if len(text.strip()) < 200:
-                        raise ValueError("Unroll returned too little text (possibly blocked/rate-limited).")
-
-                elif mode.startswith("Force direct"):
+                if mode.startswith("Force direct"):
                     # Direct only
                     effective = u
                     text, meta = fetch_text_from_url(effective)
+                    if len(text.strip()) < 200:
+                        raise ValueError("Direct fetch returned too little text (likely blocked).")
 
                 else:
-                    # Auto: unroll-first then fall back
-                    try:
-                        effective = unroll_url
-                        text, meta = fetch_text_from_url(effective)
-                        if len(text.strip()) < 200:
-                            raise ValueError("Unroll too short")
-                    except Exception:
-                        effective = u
-                        text, meta = fetch_text_from_url(effective)
+                    # Thread path: try multiple unroll providers first
+                    text, used_unroll_url, debug = try_unroll_providers(tweet_id)
+                    st.session_state.debug_log.extend(debug)
+
+                    if mode.startswith("Force thread"):
+                        if not text:
+                            raise ValueError(
+                                "Thread extraction failed across all unroll providers "
+                                "(they may be blocked/rate-limited or JS-only)."
+                            )
+                        effective = used_unroll_url
+
+                    else:
+                        # Auto mode: if unroll fails, fall back to direct fetch
+                        if text:
+                            effective = used_unroll_url
+                        else:
+                            st.session_state.debug_log.append("↩️ Auto fallback: unroll failed; trying direct fetch")
+                            effective = u
+                            text, meta = fetch_text_from_url(effective)
+
+                            if looks_like_js_loading_shell(text) or len(text.strip()) < 200:
+                                raise ValueError(
+                                    "Could not extract thread text (unroll failed and direct fetch is blocked/empty)."
+                                )
 
             # Non-X URL logic
             else:
                 text, meta = fetch_text_from_url(effective)
+                if len(text.strip()) < 200:
+                    raise ValueError("Fetched content is too short to be useful.")
 
             st.session_state.effective_url = effective
             st.session_state.extracted_text = normalize(text)
@@ -263,9 +313,13 @@ if fetch_clicked:
 if st.session_state.last_error:
     st.error(st.session_state.last_error)
     st.info(
-        "If thread extraction fails, the unroll endpoint may be down or blocked. "
-        "Try again later, or switch to 'Force direct'."
+        "This URL-only thread method depends on third-party unrollers. "
+        "If it fails, try again later or use 'Force direct' for a single-post capture."
     )
+
+if show_debug and st.session_state.debug_log:
+    st.subheader("Debug log")
+    st.code("\n".join(st.session_state.debug_log), language="text")
 
 
 if st.session_state.extracted_text:
@@ -294,7 +348,7 @@ if st.session_state.extracted_text:
         )
 
         payload = {
-            "schema_version": "0.2",
+            "schema_version": "0.3",
             "generated_at": datetime.datetime.now().isoformat(),
             "source": {
                 "id": source_id,
@@ -325,9 +379,6 @@ if st.session_state.extracted_text:
         st.session_state.generated = True
 
 
-# =========================
-# Outputs (persist after downloads)
-# =========================
 if st.session_state.generated:
     st.markdown("---")
     st.subheader("Outputs")
@@ -359,6 +410,6 @@ if st.session_state.generated:
 
 st.markdown("---")
 st.caption(
-    "Auto mode tries thread unroll first, then falls back to direct fetch. "
-    "Thread unroll relies on a third-party unroll page format like /unroll/<tweet_id>. "
+    "Auto mode tries thread unroll endpoints first and skips JS 'loading shell' pages "
+    "(e.g., 'Unrolling your thread... Gathering the Tweets...') before falling back. "
 )
