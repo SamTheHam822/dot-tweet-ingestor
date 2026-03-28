@@ -1,7 +1,7 @@
 import re
 import json
 import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -12,9 +12,9 @@ import streamlit as st
 # App Config
 # =========================
 st.set_page_config(page_title="Dot URL Ingestor", layout="wide")
-st.title("Dot URL Ingestor (v3 — URL-only, Thread-capable, Multi-Unroll)")
+st.title("Dot URL Ingestor (v4 — URL-only, Thread-capable, UnrollNow + Multi-Unroll)")
 st.caption(
-    "Paste a URL. For X/Twitter links, Auto mode tries multiple unroll endpoints (thread-first), "
+    "Paste a URL. For X/Twitter links, Auto mode tries UnrollNow (URL replacement) first, then other unroll endpoints, "
     "skips JS loading-shell pages, then falls back to direct fetch."
 )
 
@@ -34,44 +34,65 @@ def is_x_url(u: str) -> bool:
 
 
 def extract_tweet_id(u: str):
-    """
-    Extract tweet_id from:
-    https://x.com/<user>/status/<id>
-    https://twitter.com/<user>/status/<id>
-    """
     m = re.search(r"/status/(\d+)", urlparse(u).path)
     return m.group(1) if m else None
 
 
-def build_unroll_candidates(tweet_id: str):
+def unrollnow_url_from_x(u: str) -> str:
     """
-    Provider-1b: multiple deterministic unroll endpoints.
-    We try /t/<id> first, then /unroll/<id>.
+    UnrollNow supports unrolling by replacing 'x.com' with 'unrollnow.com' in the address bar.
+    We implement that deterministic transformation here.
     """
-    return [
-        {"name": "twitter-thread.com (t)", "url": f"https://twitter-thread.com/t/{tweet_id}"},
-        {"name": "twitter-thread.com (unroll)", "url": f"https://twitter-thread.com/unroll/{tweet_id}"},
+    p = urlparse(u)
+    # Normalize host
+    host = p.netloc.lower()
+    if host.endswith("twitter.com"):
+        new_netloc = "unrollnow.com"
+    elif host.endswith("x.com"):
+        new_netloc = "unrollnow.com"
+    else:
+        new_netloc = p.netloc
+
+    # Keep path + query so the unroller can identify the tweet/thread
+    return urlunparse((p.scheme or "https", new_netloc, p.path, p.params, p.query, p.fragment))
+
+
+def build_unroll_candidates(x_url: str):
+    """
+    Provider stack (unroll-first):
+    1) UnrollNow deterministic URL replacement (true URL-only)
+    2) twitter-thread.com deterministic endpoints (often helpful, but sometimes JS shells) 
+    """
+    tweet_id = extract_tweet_id(x_url)
+
+    candidates = [
+        {"name": "unrollnow.com (replace host)", "url": unrollnow_url_from_x(x_url)},
     ]
+
+    if tweet_id:
+        candidates.extend([
+            {"name": "twitter-thread.com (t)", "url": f"https://twitter-thread.com/t/{tweet_id}"},
+            {"name": "twitter-thread.com (unroll)", "url": f"https://twitter-thread.com/unroll/{tweet_id}"},
+        ])
+
+    return candidates
 
 
 def extract_visible_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove noisy tags
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
         tag.decompose()
 
     container = soup.find("article") or soup.find("main") or soup.body or soup
     text = container.get_text(separator="\n")
 
-    # Cleanup whitespace
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
 
 def strip_link_media_residue(text: str) -> str:
-    # Remove t.co and pic.twitter.com lines that add noise
     text = re.sub(r"(?im)^\shttps?://t.co/\S+\s$", "", text)
     text = re.sub(r"(?im)^\spic.twitter.com/\S+\s$", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -80,8 +101,8 @@ def strip_link_media_residue(text: str) -> str:
 
 def looks_like_js_loading_shell(text: str) -> bool:
     """
-    Detect pages that are basically a JS-driven loading shell, e.g.:
-    'Unrolling your thread... Gathering the Tweets...'
+    Detect pages that are basically JS-driven loading shells, e.g.:
+    'Unrolling your thread... Gathering the Tweets...' 
     """
     t = (text or "").lower()
     signals = [
@@ -96,7 +117,7 @@ def looks_like_js_loading_shell(text: str) -> bool:
 
 
 def fetch_html(u: str):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; DotURLIngestor/3.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DotURLIngestor/4.0)"}
     r = requests.get(u, headers=headers, timeout=25, allow_redirects=True)
     r.raise_for_status()
     meta = {
@@ -117,13 +138,15 @@ def fetch_text_from_url(u: str):
     return text, meta
 
 
-def try_unroll_providers(tweet_id: str, min_chars: int = 400):
+def try_unroll_stack(x_url: str, min_chars: int = 400):
     """
-    Try multiple unroll endpoints and return:
+    Try multiple unroll candidates and return:
     (best_text, used_url, debug_log)
     """
     debug = []
-    for cand in build_unroll_candidates(tweet_id):
+    candidates = build_unroll_candidates(x_url)
+
+    for cand in candidates:
         name = cand["name"]
         url = cand["url"]
         try:
@@ -139,6 +162,7 @@ def try_unroll_providers(tweet_id: str, min_chars: int = 400):
                 continue
 
             return text, url, debug
+
         except Exception as e:
             debug.append(f"❌ {name}: error: {str(e)}")
 
@@ -166,7 +190,7 @@ def build_source_md(source_id, title, published, url, author, state, intent, con
         "---",
         "",
         "## Notes",
-        "- URL-only thread ingestion using multi-unroll providers.",
+        "- URL-only thread ingestion using UnrollNow + fallback unroll endpoints. ",
         "- Treat claims as Provisional unless validated against the source.",
     ])
 
@@ -258,10 +282,6 @@ if fetch_clicked:
 
         try:
             if is_x_url(u):
-                tweet_id = extract_tweet_id(u)
-                if not tweet_id:
-                    raise ValueError("Could not find tweet_id in the URL. Expected /status/<id>.")
-
                 if mode.startswith("Force direct"):
                     effective = u
                     text, meta = fetch_text_from_url(effective)
@@ -269,17 +289,16 @@ if fetch_clicked:
                         raise ValueError("Direct fetch returned too little text (likely blocked).")
 
                 else:
-                    text, used_unroll_url, debug = try_unroll_providers(tweet_id)
+                    text, used_url, debug = try_unroll_stack(u)
                     st.session_state.debug_log.extend(debug)
 
                     if mode.startswith("Force thread"):
                         if not text:
-                            raise ValueError("Thread extraction failed across all unroll providers.")
-                        effective = used_unroll_url
-
+                            raise ValueError("Thread extraction failed across all unroll providers (including UnrollNow).")
+                        effective = used_url
                     else:
                         if text:
-                            effective = used_unroll_url
+                            effective = used_url
                         else:
                             st.session_state.debug_log.append("↩️ Auto fallback: unroll failed; trying direct fetch")
                             effective = u
@@ -338,7 +357,7 @@ if st.session_state.extracted_text:
         )
 
         payload = {
-            "schema_version": "0.3",
+            "schema_version": "0.4",
             "generated_at": datetime.datetime.now().isoformat(),
             "source": {
                 "id": source_id,
@@ -400,6 +419,6 @@ if st.session_state.generated:
 
 st.markdown("---")
 st.caption(
-    "Auto mode tries thread unroll endpoints first and skips JS 'loading shell' pages "
-    "before falling back to direct fetch."
+    "UnrollNow supports URL unrolling by replacing 'x.com' with 'unrollnow.com' in the address bar.  "
+    "We try that first, then fallback unroll endpoints, then direct fetch."
 )
