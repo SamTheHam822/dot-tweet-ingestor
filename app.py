@@ -76,4 +76,3 @@ Captured text:
     st.download_button("Download source.md", source_md, file_name="source.md")
     st.download_button("Download dot_payload.json", json.dumps(payload,indent=2), file_name="dot_payload.json")
     st.text_area("Ingestion Prompt (copy/paste)", prompt, height=200)
-``
