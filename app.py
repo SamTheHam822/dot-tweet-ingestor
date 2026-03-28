@@ -32,6 +32,11 @@ def is_x_url(u: str) -> bool:
     host = (urlparse(u).netloc or "").lower()
     return host.endswith("x.com") or host.endswith("twitter.com")
 
+def is_threadreader_url(u: str) -> bool:
+    """
+    Thread Reader App bot returns an unrolled page on threadreaderapp.com, which we can fetch like a normal article. 
+    """
+    return "threadreaderapp.com" in (urlparse(u).netloc or "").lower()
 
 def extract_tweet_id(u: str):
     m = re.search(r"/status/(\d+)", urlparse(u).path)
@@ -281,7 +286,12 @@ if fetch_clicked:
         effective = u
 
         try:
-            if is_x_url(u):
+            if is_threadreader_url(u):
+                # Already-unrolled thread page → fetch directly like an article page. 
+                text, meta = fetch_text_from_url(effective)
+
+            # Existing X / unroll logic stays exactly as-is below
+            elif is_x_url(u):
                 if mode.startswith("Force direct"):
                     effective = u
                     text, meta = fetch_text_from_url(effective)
