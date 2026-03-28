@@ -357,7 +357,27 @@ for k, v in defaults.items():
 # UI
 # =========================
 st.subheader("1) Paste URL")
-url_main = st.text_input("URL", placeholder="https://x.com/...")
+
+# --- iOS Shortcut support: prefill URL from query string (?url=...) ---
+# This lets Share Sheet -> Shortcut -> Safari open your app with the URL already filled.
+try:
+    params = st.query_params  # Streamlit's query param interface
+    incoming = params.get("url", None)
+    if incoming:
+        # Only overwrite once per page load to avoid fighting your manual edits
+        if not st.session_state.get("url_prefilled_once", False):
+            st.session_state["url_prefill"] = incoming
+            st.session_state["url_prefilled_once"] = True
+except Exception:
+    # If running on an older Streamlit version, ignore and let manual input work
+    pass
+
+
+url_main = st.text_input(
+    "URL",
+    value=st.session_state.get("url_prefill", ""),
+    placeholder="https://x.com/..."
+)
 
 mode = st.radio(
     "Mode",
