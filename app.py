@@ -165,77 +165,94 @@ def dot_worthiness_label(score: float):
     
 def extract_threadreader_text(html: str) -> str:
     """
-    Slice ThreadReaderApp page down to just the thread text (strip UI, donate, crypto, etc.).
-    Thread Reader App pages include extra UI around the thread. 
+    Extract only the actual unrolled thread body from ThreadReaderApp pages,
+    avoiding 'More from' / promo / donation / crypto / how-to UI blocks.
     """
     soup = BeautifulSoup(html, "lxml")
+
+    # Remove noisy tags
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
         tag.decompose()
 
     main = soup.find("main") or soup.find("article") or soup.body or soup
     raw = main.get_text(separator="\n")
+
+    # Normalize whitespace
     raw = re.sub(r"[ \t]+\n", "\n", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
 
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
-    # Start anchor: first substantive thread line if present (works for this class of threads)
+    # -------------------------
+    # Identify start of main thread body
+    # -------------------------
+    # Prefer start after the header that includes tweet count / read time:
+    # e.g. "• 11 tweets • 5 min read •"
     start_idx = None
     for i, ln in enumerate(lines):
-        if ln.startswith("My dear front-end developers"):
-            start_idx = i
-            break
-        if ln.startswith("1/"):
-            start_idx = i
+        if re.search(r"\b\d+\s+tweets\b", ln) and ("min read" in ln.lower() or "tweets" in ln.lower()):
+            # Start shortly after the header block
+            start_idx = min(i + 1, len(lines) - 1)
             break
 
-    # Fallback start: after the "tweets / read" header area
+    # If not found, fall back to first occurrence of an @handle (author handle)
     if start_idx is None:
         for i, ln in enumerate(lines):
-            if re.search(r"\b\d+\s+tweets\b", ln):
+            if re.match(r"^@[\w_]{1,30}$", ln):
                 start_idx = min(i + 1, len(lines) - 1)
                 break
 
+    # Last resort: use entire text
     if start_idx is None:
         start_idx = 0
 
-    # End anchors: promo/support blocks
+    # -------------------------
+    # Identify end of main thread body
+    # -------------------------
     end_markers = [
+        "Missing some Tweet in this thread?",
+        "force a refresh",
         "Keep Current with",
         "Stay in touch and get notified",
         "This Thread may be Removed Anytime",
+        "Twitter may remove this content",
         "Try unrolling a thread yourself",
         "Did Thread Reader help you today",
+        "Support us!",
         "Become a Premium Member",
+        "Make a small donation",
         "Donate via Paypal",
         "Or Donate anonymously using crypto",
         "Email the whole thread",
-        "Support us!",
+        "More from",               # KEY FIX: prevents grabbing the feed section
+        "More Threads",            # defensive
+        "More unrolls",            # defensive
     ]
 
-    end_idx = None
+    end_idx = len(lines)
     for i in range(start_idx, len(lines)):
         if any(lines[i].startswith(m) for m in end_markers):
             end_idx = i
             break
-    if end_idx is None:
-        end_idx = len(lines)
 
     core = lines[start_idx:end_idx]
 
-    # Remove remaining UI fragments + crypto address lines
+    # -------------------------
+    # Cleanup: remove leftover UI / crypto / boilerplate
+    # -------------------------
     kill_exact = {"×", "Post", "Share", "Email", "Send Email!", "Follow Us!", "copy"}
     kill_contains = [
+        "Share this page",
+        "Enter URL or ID to Unroll",
         "How to get URL link on X",
         "Copy Link to Tweet",
         "Paste it above and click",
         "More info at",
         "Twitter Help",
         "@threadreaderapp unroll",
-        "Enter URL or ID to Unroll",
+        "Practice here",
         "Read on X",
         "Scrolly",
-        "force a refresh",
     ]
 
     cleaned = []
@@ -244,15 +261,17 @@ def extract_threadreader_text(html: str) -> str:
             continue
         if any(s.lower() in ln.lower() for s in kill_contains):
             continue
-        if re.match(r"^0x[a-fA-F0-9]{40}$", ln):  # Ethereum-like
+        # Strip obvious crypto addresses
+        if re.match(r"^0x[a-fA-F0-9]{40}$", ln):  # Ethereum
             continue
-        if re.match(r"^[13]{25,34}$", ln):  # Bitcoin-like
+        if re.match(r"^[13]{25,34}$", ln):  # Bitcoin
             continue
         cleaned.append(ln)
 
     out = "\n".join(cleaned)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
+
 
 
 def fetch_html(u: str, timeout: int = 20):
