@@ -72,7 +72,8 @@ def dot_worthiness_score(text: str):
     # Positive signals
     has_numbers = bool(re.search(r"\b\d+(.\d+)?\b", t))
     has_steps = bool(re.search(r"(?m)^\s*(\d+.|-|\u2022)\s+", t))
-    has_codeish = ("" in t) or bool(re.search(r"\b(npm|pip|git|curl|bun|sql|api|repo|install)\b", tl)) has_links = ("http" in tl) or ("www." in tl) or bool(re.search(r"\bgithub.com\b", tl))
+    has_codeish = ("" in t) or bool(re.search(r"\b(npm|pip|git|curl|bun|sql|api|repo|install)\b", tl)) 
+    has_links = ("http" in tl) or ("www." in tl) or bool(re.search(r"\bgithub.com\b", tl))
     # Density proxy: more info per line implies higher signal
     avg_line_len = n_chars / max(n_lines, 1)
     density = min(1.0, avg_line_len / 120.0)  # saturates ~120 chars/line
