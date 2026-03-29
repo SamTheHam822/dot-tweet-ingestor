@@ -51,7 +51,117 @@ def strip_link_media_residue(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
+### START: DOT WORTHINESS HELPERS ###
 
+def dot_worthiness_score(text: str):
+    """
+    Returns (score_0_to_10, reasons_list).
+    Primary axis: Dot Skill OS / personal learning compounding.
+    Heuristic-only, based on extracted text content (no web calls).
+    """
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return 0.0, ["No extracted text."]
+
+    tl = t.lower()
+    n_chars = len(t)
+    n_lines = len([ln for ln in t.splitlines() if ln.strip()])
+
+    # Positive signals
+    has_numbers = bool(re.search(r"\b\d+(.\d+)?\b", t))
+    has_steps = bool(re.search(r"(?m)^\s*(\d+.|-|\u2022)\s+", t))
+    has_codeish = ("" in t) or bool(re.search(r"\b(npm|pip|git|curl|bun|sql|api|repo|install)\b", tl)) has_links = ("http" in tl) or ("www." in tl) or bool(re.search(r"\bgithub.com\b", tl))
+    # Density proxy: more info per line implies higher signal
+    avg_line_len = n_chars / max(n_lines, 1)
+    density = min(1.0, avg_line_len / 120.0)  # saturates ~120 chars/line
+    
+    # Clickbait / authority laundering
+    clickbait_markers = [
+        "finally", "insane", "must read", "this changes everything",
+        "you won't believe", "secret", "shocking", "breaking", "staggering",
+        "game changer", "exposed", "22k", "stars"
+    ]
+    authority_markers = [
+        "direct from", "and team", "legendary", "genius",
+        "from the creator of", "the definitive", "best practice", "best practices"
+    ]
+    clickbait_hits = sum(1 for m in clickbait_markers if m in tl)
+    authority_hits = sum(1 for m in authority_markers if m in tl)
+    
+    # Score components (0–10)
+    score = 0.0
+    reasons = []
+
+    # Base: content volume
+    if n_chars > 2500:
+        score += 2.2; reasons.append("High content volume (more substance to compound).")
+    elif n_chars > 1000:
+        score += 1.6; reasons.append("Moderate content volume (enough to learn from).")
+    else:
+        score += 0.6; reasons.append("Low content volume (likely a pointer).")
+    
+    # Specificity & actionability
+    if has_numbers:
+        score += 1.1; reasons.append("Contains concrete details (numbers/metrics).")
+    if has_steps:
+        score += 1.6; reasons.append("Structured steps/bullets → reusable skill pattern.")
+    if has_codeish:
+        score += 1.4; reasons.append("Technical/operational content → skill-installation potential.")
+    if has_links:
+        score += 0.5; reasons.append("Has references (good for provenance).")
+    
+    # Density (information per line)
+    score += 1.6 * density
+    if density > 0.7:
+        reasons.append("High information density (low fluff).")
+    elif density > 0.4:
+        reasons.append("Moderate information density.")
+    else:
+        reasons.append("Low information density (more fluff).")
+    
+    # Deductions
+    score -= 0.9 * clickbait_hits
+    if clickbait_hits:
+        reasons.append(f"Clickbait language detected ({clickbait_hits}).")
+    
+    score -= 0.7 * authority_hits
+    if authority_hits:
+        reasons.append(f"Authority-signaling without evidence ({authority_hits}).")
+    
+    # Clamp
+    score = max(0.0, min(10.0, round(score, 1)))
+    
+    # Make 10 rare: require structured + verifiable substance
+    if score > 9.5 and not (has_steps and (has_numbers or has_codeish) and n_chars > 1400):
+        score = 9.4
+        reasons.append("Capped below 10: not enough structured, verifiable substance.")
+    
+    return score, reasons
+    
+    ### START: DOT WORTHINESS LABEL ###
+    
+def dot_worthiness_label(score: float):
+        """
+        Primary axis A: Dot Skill OS / personal learning compounding (foundational).
+        Returns (label, short meaning).
+        """
+        if score < 3:
+            return "🗑️ Noise", "Not worth ingesting into Dot."
+        if score < 5:
+            return "📍 Pointer", "Reference-only; low compounding."
+        if score < 7:
+            return "🧪 Optional", "Some value, but not core skill."
+        if score < 9:
+            return "⚙️ Skill‑Building", "Worth ingesting for capability growth."
+        if score < 10:
+            return "🧠 High‑Leverage", "Strong compounding potential."
+        return "🔥 Canonical", "Core Dot Skill OS asset."
+    
+    ### END: DOT WORTHINESS LABEL ###
+
+    
 def extract_threadreader_text(html: str) -> str:
     """
     Slice ThreadReaderApp page down to just the thread text (strip UI, donate, crypto, etc.).
@@ -247,6 +357,19 @@ if "url_prefilled_once" not in st.session_state:
     st.session_state.url_prefilled_once = False
 if "url_prefill" not in st.session_state:
     st.session_state.url_prefill = ""
+    
+### START: DOT WORTHINESS SESSION STATE ###
+
+if "worthiness_score" not in st.session_state:
+    st.session_state.worthiness_score = None
+if "worthiness_label" not in st.session_state:
+    st.session_state.worthiness_label = ""
+if "worthiness_meaning" not in st.session_state:
+    st.session_state.worthiness_meaning = ""
+if "worthiness_reasons" not in st.session_state:
+    st.session_state.worthiness_reasons = []
+
+### END: DOT WORTHINESS SESSION STATE ###
 
 # Prefill URL from iOS Shortcut (?url=...)
 try:
@@ -363,6 +486,16 @@ if fetch_clicked:
         st.session_state.source_md = source_md
         st.session_state.payload_str = json.dumps(payload, indent=2)
         st.session_state.prompt = prompt
+        
+        # --- Compute Dot Worthiness (A: Skill OS compounding) ---
+        score, reasons = dot_worthiness_score(st.session_state.extracted_text)
+        label, meaning = dot_worthiness_label(score)
+        
+        st.session_state.worthiness_score = score
+        st.session_state.worthiness_label = label
+        st.session_state.worthiness_meaning = meaning
+        st.session_state.worthiness_reasons = reasons
+        
         st.session_state.generated = True
 
     except Exception as e:
@@ -376,6 +509,30 @@ if fetch_clicked:
 if st.session_state.generated:
     st.markdown("---")
     st.subheader("Preview")
+    st.subheader("Dot Worthiness")
+
+    score = st.session_state.worthiness_score
+    label = st.session_state.worthiness_label
+    meaning = st.session_state.worthiness_meaning
+    reasons = st.session_state.worthiness_reasons
+    
+    # Dial-like visualization (0–100) + label
+    st.progress(int(score * 10))
+    st.markdown(
+        f"### **{score} / 10 — {label}**  \n"
+        f"{meaning}",
+        unsafe_allow_html=True
+    )
+    
+    # 🔥 moment
+    if score == 10.0:
+        st.success("🔥🔥🔥 CANONICAL DOT ASSET 🔥🔥🔥")
+        st.balloons()
+    
+    with st.expander("Why this score?", expanded=False):
+        for r in reasons[:10]:
+            st.write(f"- {r}")
+
     st.text_area("Extracted text", st.session_state.extracted_text, height=260)
     st.caption(f"Extracted via: {st.session_state.effective_url}")
 
